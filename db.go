@@ -12,6 +12,7 @@ var db *sql.DB
 
 func initDB() {
 	os.MkdirAll("./data", 0755)
+	os.MkdirAll("./data/cunz", 0755)
 	var err error
 	db, err = sql.Open("sqlite3", "./data/mc_depsync.db")
 	if err != nil {

@@ -27,7 +27,7 @@ func main() {
 	mux.HandleFunc("POST /api/auth/register", handleRegister)
 	mux.HandleFunc("POST /api/auth/login", handleLogin)
 
-	mux.Handle("GET /download/", http.StripPrefix("/download/", http.FileServer(http.Dir("./data/modpacks"))))
+	mux.Handle("GET /download/cunz/", http.StripPrefix("/download/cunz/", http.FileServer(http.Dir("./data/cunz"))))
 	mux.HandleFunc("GET /api/modpacks/{modpack_id}/manifest/latest", func(w http.ResponseWriter, r *http.Request) {
 		packID := r.PathValue("modpack_id")
 		http.ServeFile(w, r, filepath.Join("./data/modpacks", packID, "manifests", "latest.json"))

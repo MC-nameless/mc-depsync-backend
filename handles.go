@@ -70,46 +70,28 @@ func handleUploadMod(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tempFileName := "temp_" + header.Filename
-	tempPath := filepath.Join("./data/modpacks", packID, "mods", tempFileName)
-	tempFile, _ := os.Create(tempPath)
-
+	tempFile, _ := os.CreateTemp("./data", "upload_*")
 	h := sha256.New()
 	writer := io.MultiWriter(tempFile, h)
 	io.Copy(writer, file)
 	tempFile.Close()
 
-	uploadedHash := hex.EncodeToString(h.Sum(nil))
+	fileHash := hex.EncodeToString(h.Sum(nil))
+	cunzPath := filepath.Join("./data/cunz", fileHash)
 
-	// 检测重复模组
-	modsDir := filepath.Join("./data/modpacks", packID, "mods")
-	finalPath := filepath.Join(modsDir, header.Filename)
-
-	existingPath := findGlobalDuplicate(header.Size, uploadedHash, tempFileName)
-	if existingPath != "" {
-		os.Remove(tempPath)
-
-		// 创建硬链接
-		os.Remove(finalPath) // 覆盖同名文件
-		if err := os.Link(existingPath, finalPath); err != nil {
-			// 硬链接失败 退化为物理复制
-			src, _ := os.Open(existingPath)
-			dst, _ := os.Create(finalPath)
-			io.Copy(dst, src)
-			src.Close()
-			dst.Close()
-		}
-
-		// 扣除空间
-		db.Exec("UPDATE users SET used_bytes = used_bytes + ? WHERE id = ?", header.Size, ownerID)
-		w.Write([]byte(`{"status": "skipped", "message": "Global Deduplication Success"}`))
-		return
+	statusMsg := "success"
+	if _, err := os.Stat(cunzPath); os.IsNotExist(err) {
+		os.Rename(tempFile.Name(), cunzPath)
+	} else {
+		os.Remove(tempFile.Name())
+		statusMsg = "skipped"
 	}
-	os.Remove(finalPath)
-	os.Rename(tempPath, finalPath)
-	db.Exec("UPDATE users SET used_bytes = used_bytes + ? WHERE id = ?", header.Size, ownerID)
 
-	w.Write([]byte(`{"status": "success"}`))
+	pointerPath := filepath.Join("./data/modpacks", packID, "mods", header.Filename)
+	os.WriteFile(pointerPath, []byte(fileHash), 0644)
+
+	db.Exec("UPDATE users SET used_bytes = used_bytes + ? WHERE id = ?", header.Size, ownerID)
+	w.Write([]byte(fmt.Sprintf(`{"status": "%s", "message": "CAS Deduplication Check"}`, statusMsg)))
 }
 
 // 生成该整合包的新清单
@@ -128,25 +110,27 @@ func handleGenerateManifest(w http.ResponseWriter, r *http.Request) {
 	manifestsDir := filepath.Join("./data/modpacks", packID, "manifests")
 
 	var entries []FileEntry
-	filepath.Walk(modsDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
-			return nil
+	files, _ := os.ReadDir(modsDir)
+	for _, f := range files {
+		if f.IsDir() {
+			continue
 		}
-		relPath, _ := filepath.Rel(modsDir, path)
-		relPath = filepath.ToSlash(filepath.Join("mods", relPath))
 
-		f, _ := os.Open(path)
-		h := sha256.New()
-		io.Copy(h, f)
-		f.Close()
-
+		hashBytes, err := os.ReadFile(filepath.Join(modsDir, f.Name()))
+		if err != nil {
+			continue
+		}
+		hashStr := string(hashBytes)
+		cunzInfo, err := os.Stat(filepath.Join("./data/cunz", hashStr))
+		if err != nil {
+			continue
+		}
 		entries = append(entries, FileEntry{
-			Path:   relPath,
-			SHA256: hex.EncodeToString(h.Sum(nil)),
-			Size:   info.Size(),
+			Path:   filepath.ToSlash(filepath.Join("mods", f.Name())),
+			SHA256: hashStr,
+			Size:   cunzInfo.Size(),
 		})
-		return nil
-	})
+	}
 
 	var currentVer int
 	db.QueryRow("SELECT latest_version FROM modpacks WHERE id = ?", packID).Scan(&currentVer)
@@ -158,7 +142,6 @@ func handleGenerateManifest(w http.ResponseWriter, r *http.Request) {
 		Files:       entries,
 	}
 
-	// 写入独立目录
 	data, _ := json.MarshalIndent(manifest, "", "  ")
 	os.WriteFile(filepath.Join(manifestsDir, fmt.Sprintf("manifest_%d.json", newVer)), data, 0644)
 	os.WriteFile(filepath.Join(manifestsDir, "latest.json"), data, 0644)
@@ -205,9 +188,12 @@ func handleListMods(w http.ResponseWriter, r *http.Request) {
 	var mods []ModInfo
 	for _, f := range files {
 		if !f.IsDir() {
-			info, err := f.Info()
+			hashBytes, err := os.ReadFile(filepath.Join(modsDir, f.Name()))
 			if err == nil {
-				mods = append(mods, ModInfo{Name: f.Name(), Size: info.Size()})
+				cunzInfo, err := os.Stat(filepath.Join("./data/cunz", string(hashBytes)))
+				if err == nil {
+					mods = append(mods, ModInfo{Name: f.Name(), Size: cunzInfo.Size()})
+				}
 			}
 		}
 	}
@@ -229,6 +215,10 @@ func handleRenameMod(w http.ResponseWriter, r *http.Request) {
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 
+	if len(req.NewName) < 4 || req.NewName[len(req.NewName)-4:] != ".jar" {
+		req.NewName += ".jar"
+	}
+
 	var ownerID int
 	err := db.QueryRow("SELECT owner_id FROM modpacks WHERE id = ?", packID).Scan(&ownerID)
 	if err != nil || ownerID != userID {
@@ -238,7 +228,7 @@ func handleRenameMod(w http.ResponseWriter, r *http.Request) {
 
 	oldPath := filepath.Join("./data/modpacks", packID, "mods", oldName)
 	newPath := filepath.Join("./data/modpacks", packID, "mods", req.NewName)
-	os.Rename(oldPath, newPath)
+	os.Rename(oldPath, newPath) // 仅重命名指针文件
 
 	w.Write([]byte(`{"status": "renamed"}`))
 }
@@ -256,55 +246,59 @@ func handleDeleteMod(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	targetPath := filepath.Join("./data/modpacks", packID, "mods", filename)
-	info, err := os.Stat(targetPath)
+	pointerPath := filepath.Join("./data/modpacks", packID, "mods", filename)
+	hashBytes, err := os.ReadFile(pointerPath)
 	if err == nil {
-		db.Exec("UPDATE users SET used_bytes = used_bytes - ? WHERE id = ?", info.Size(), ownerID)
+		cunzInfo, err := os.Stat(filepath.Join("./data/cunz", string(hashBytes)))
+		if err == nil {
+			db.Exec("UPDATE users SET used_bytes = used_bytes - ? WHERE id = ?", cunzInfo.Size(), ownerID)
+		}
+		os.Remove(pointerPath) // 仅删除指针文件 保留 cunz 内的实体文件供其他整合包复用
 	}
-	os.Remove(targetPath)
+
 	w.Write([]byte(`{"status": "deleted"}`))
 }
 
-// 检测重复模组
-func findGlobalDuplicate(targetSize int64, targetHash string, tempFileName string) string {
-	modpacksDir := "./data/modpacks"
-	packs, err := os.ReadDir(modpacksDir)
-	if err != nil {
-		return ""
-	}
+// // 检测重复模组
+// func findGlobalDuplicate(targetSize int64, targetHash string, tempFileName string) string {
+// 	modpacksDir := "./data/modpacks"
+// 	packs, err := os.ReadDir(modpacksDir)
+// 	if err != nil {
+// 		return ""
+// 	}
 
-	for _, p := range packs {
-		if !p.IsDir() {
-			continue
-		}
-		modsDir := filepath.Join(modpacksDir, p.Name(), "mods")
-		files, err := os.ReadDir(modsDir)
-		if err != nil {
-			continue
-		}
+// 	for _, p := range packs {
+// 		if !p.IsDir() {
+// 			continue
+// 		}
+// 		modsDir := filepath.Join(modpacksDir, p.Name(), "mods")
+// 		files, err := os.ReadDir(modsDir)
+// 		if err != nil {
+// 			continue
+// 		}
 
-		for _, f := range files {
-			if f.IsDir() || f.Name() == tempFileName {
-				continue
-			}
-			info, _ := f.Info()
-			if info.Size() != targetSize {
-				continue
-			}
+// 		for _, f := range files {
+// 			if f.IsDir() || f.Name() == tempFileName {
+// 				continue
+// 			}
+// 			info, _ := f.Info()
+// 			if info.Size() != targetSize {
+// 				continue
+// 			}
 
-			path := filepath.Join(modsDir, f.Name())
-			file, _ := os.Open(path)
-			h := sha256.New()
-			io.Copy(h, file)
-			file.Close()
+// 			path := filepath.Join(modsDir, f.Name())
+// 			file, _ := os.Open(path)
+// 			h := sha256.New()
+// 			io.Copy(h, file)
+// 			file.Close()
 
-			if hex.EncodeToString(h.Sum(nil)) == targetHash {
-				return path // 返回物理路径
-			}
-		}
-	}
-	return ""
-}
+// 			if hex.EncodeToString(h.Sum(nil)) == targetHash {
+// 				return path // 返回物理路径
+// 			}
+// 		}
+// 	}
+// 	return ""
+// }
 
 // 管理员接口：列出所有用户及其配额使用情况
 func handleAdminListUsers(w http.ResponseWriter, r *http.Request) {
