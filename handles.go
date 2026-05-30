@@ -83,14 +83,29 @@ func handleUploadMod(w http.ResponseWriter, r *http.Request) {
 
 	// 检测重复模组
 	modsDir := filepath.Join("./data/modpacks", packID, "mods")
-	if isDuplicateMod(modsDir, header.Size, uploadedHash, tempFileName) {
+	finalPath := filepath.Join(modsDir, header.Filename)
+
+	existingPath := findGlobalDuplicate(header.Size, uploadedHash, tempFileName)
+	if existingPath != "" {
 		os.Remove(tempPath)
-		w.Write([]byte(`{"status": "skipped", "message": "File already exists"}`))
+
+		// 创建硬链接
+		os.Remove(finalPath) // 覆盖同名文件
+		if err := os.Link(existingPath, finalPath); err != nil {
+			// 硬链接失败 退化为物理复制
+			src, _ := os.Open(existingPath)
+			dst, _ := os.Create(finalPath)
+			io.Copy(dst, src)
+			src.Close()
+			dst.Close()
+		}
+
+		// 扣除空间
+		db.Exec("UPDATE users SET used_bytes = used_bytes + ? WHERE id = ?", header.Size, ownerID)
+		w.Write([]byte(`{"status": "skipped", "message": "Global Deduplication Success"}`))
 		return
 	}
-
-	// 保存文件并扣除空间
-	finalPath := filepath.Join(modsDir, header.Filename)
+	os.Remove(finalPath)
 	os.Rename(tempPath, finalPath)
 	db.Exec("UPDATE users SET used_bytes = used_bytes + ? WHERE id = ?", header.Size, ownerID)
 
@@ -251,28 +266,44 @@ func handleDeleteMod(w http.ResponseWriter, r *http.Request) {
 }
 
 // 检测重复模组
-func isDuplicateMod(modsDir string, targetSize int64, targetHash string, tempFileName string) bool {
-	files, _ := os.ReadDir(modsDir)
-	for _, f := range files {
-		if f.IsDir() || f.Name() == tempFileName {
+func findGlobalDuplicate(targetSize int64, targetHash string, tempFileName string) string {
+	modpacksDir := "./data/modpacks"
+	packs, err := os.ReadDir(modpacksDir)
+	if err != nil {
+		return ""
+	}
+
+	for _, p := range packs {
+		if !p.IsDir() {
 			continue
 		}
-		info, _ := f.Info()
-		if info.Size() != targetSize {
+		modsDir := filepath.Join(modpacksDir, p.Name(), "mods")
+		files, err := os.ReadDir(modsDir)
+		if err != nil {
 			continue
 		}
 
-		path := filepath.Join(modsDir, f.Name())
-		file, _ := os.Open(path)
-		h := sha256.New()
-		io.Copy(h, file)
-		file.Close()
+		for _, f := range files {
+			if f.IsDir() || f.Name() == tempFileName {
+				continue
+			}
+			info, _ := f.Info()
+			if info.Size() != targetSize {
+				continue
+			}
 
-		if hex.EncodeToString(h.Sum(nil)) == targetHash {
-			return true
+			path := filepath.Join(modsDir, f.Name())
+			file, _ := os.Open(path)
+			h := sha256.New()
+			io.Copy(h, file)
+			file.Close()
+
+			if hex.EncodeToString(h.Sum(nil)) == targetHash {
+				return path // 返回物理路径
+			}
 		}
 	}
-	return false
+	return ""
 }
 
 // 管理员接口：列出所有用户及其配额使用情况
