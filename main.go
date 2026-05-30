@@ -1,6 +1,8 @@
 package main
 
 import (
+	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"path/filepath"
@@ -19,6 +21,9 @@ type Manifest struct {
 }
 
 func main() {
+	port := flag.Int("p", 8080, "The port to listen on")
+	flag.Parse()
+
 	initDB()
 	defer db.Close()
 
@@ -45,8 +50,9 @@ func main() {
 
 	handler := corsMiddleware(mux)
 
-	log.Println("Backend running on :8080...")
-	http.ListenAndServe(":8080", handler)
+	addr := fmt.Sprintf(":%d", *port)
+	log.Printf("Backend running on %s...", addr)
+	log.Fatal(http.ListenAndServe(addr, handler))
 }
 
 func corsMiddleware(next http.Handler) http.Handler {
