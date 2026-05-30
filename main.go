@@ -26,7 +26,7 @@ func main() {
 
 	mux.HandleFunc("POST /api/auth/register", handleRegister)
 	mux.HandleFunc("POST /api/auth/login", handleLogin)
-	
+
 	mux.Handle("GET /download/", http.StripPrefix("/download/", http.FileServer(http.Dir("./data/modpacks"))))
 	mux.HandleFunc("GET /api/modpacks/{modpack_id}/manifest/latest", func(w http.ResponseWriter, r *http.Request) {
 		packID := r.PathValue("modpack_id")
@@ -36,9 +36,12 @@ func main() {
 	mux.HandleFunc("POST /api/modpacks", AuthMiddleware(handleCreateModpack))
 	mux.HandleFunc("POST /api/modpacks/{modpack_id}/upload", AuthMiddleware(handleUploadMod))
 	mux.HandleFunc("POST /api/modpacks/{modpack_id}/manifest/generate", AuthMiddleware(handleGenerateManifest))
+	mux.HandleFunc("PUT /api/modpacks/{modpack_id}/mods/{filename}", AuthMiddleware(handleRenameMod))
 	mux.HandleFunc("GET /api/modpacks", AuthMiddleware(handleListModpacks))
 	mux.HandleFunc("GET /api/modpacks/{modpack_id}/mods", AuthMiddleware(handleListMods))
 	mux.HandleFunc("DELETE /api/modpacks/{modpack_id}/mods/{filename}", AuthMiddleware(handleDeleteMod))
+	mux.HandleFunc("GET /api/admin/users", AdminMiddleware(handleAdminListUsers))
+	mux.HandleFunc("PUT /api/admin/users/{user_id}", AdminMiddleware(handleAdminUpdateUser))
 
 	handler := corsMiddleware(mux)
 

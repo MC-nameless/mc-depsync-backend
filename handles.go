@@ -14,6 +14,11 @@ import (
 	"github.com/google/uuid"
 )
 
+type ModInfo struct {
+	Name string `json:"name"`
+	Size int64  `json:"size"`
+}
+
 // 创建新整合包
 func handleCreateModpack(w http.ResponseWriter, r *http.Request) {
 	userID := r.Context().Value("userID").(int)
@@ -58,10 +63,36 @@ func handleUploadMod(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	destPath := filepath.Join("./data/modpacks", packID, "mods", header.Filename)
-	destFile, _ := os.Create(destPath)
-	defer destFile.Close()
-	io.Copy(destFile, file)
+	var quota, used int64
+	db.QueryRow("SELECT quota_bytes, used_bytes FROM users WHERE id = ?", ownerID).Scan(&quota, &used)
+	if used+header.Size > quota {
+		http.Error(w, "Quota exceeded: 空间不足", http.StatusForbidden)
+		return
+	}
+
+	tempFileName := "temp_" + header.Filename
+	tempPath := filepath.Join("./data/modpacks", packID, "mods", tempFileName)
+	tempFile, _ := os.Create(tempPath)
+
+	h := sha256.New()
+	writer := io.MultiWriter(tempFile, h)
+	io.Copy(writer, file)
+	tempFile.Close()
+
+	uploadedHash := hex.EncodeToString(h.Sum(nil))
+
+	// 检测重复模组
+	modsDir := filepath.Join("./data/modpacks", packID, "mods")
+	if isDuplicateMod(modsDir, header.Size, uploadedHash, tempFileName) {
+		os.Remove(tempPath)
+		w.Write([]byte(`{"status": "skipped", "message": "File already exists"}`))
+		return
+	}
+
+	// 保存文件并扣除空间
+	finalPath := filepath.Join(modsDir, header.Filename)
+	os.Rename(tempPath, finalPath)
+	db.Exec("UPDATE users SET used_bytes = used_bytes + ? WHERE id = ?", header.Size, ownerID)
 
 	w.Write([]byte(`{"status": "success"}`))
 }
@@ -156,18 +187,45 @@ func handleListMods(w http.ResponseWriter, r *http.Request) {
 	modsDir := filepath.Join("./data/modpacks", packID, "mods")
 	files, _ := os.ReadDir(modsDir)
 
-	var fileNames []string
+	var mods []ModInfo
 	for _, f := range files {
 		if !f.IsDir() {
-			fileNames = append(fileNames, f.Name())
+			info, err := f.Info()
+			if err == nil {
+				mods = append(mods, ModInfo{Name: f.Name(), Size: info.Size()})
+			}
 		}
 	}
-	if fileNames == nil {
-		fileNames = []string{}
+	if mods == nil {
+		mods = []ModInfo{}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(fileNames)
+	json.NewEncoder(w).Encode(mods)
+}
+
+// 重命名模组
+func handleRenameMod(w http.ResponseWriter, r *http.Request) {
+	packID := r.PathValue("modpack_id")
+	userID := r.Context().Value("userID").(int)
+	oldName := r.PathValue("filename")
+	var req struct {
+		NewName string `json:"new_name"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
+	var ownerID int
+	err := db.QueryRow("SELECT owner_id FROM modpacks WHERE id = ?", packID).Scan(&ownerID)
+	if err != nil || ownerID != userID {
+		http.Error(w, "Forbidden: You don't own this modpack", http.StatusForbidden)
+		return
+	}
+
+	oldPath := filepath.Join("./data/modpacks", packID, "mods", oldName)
+	newPath := filepath.Join("./data/modpacks", packID, "mods", req.NewName)
+	os.Rename(oldPath, newPath)
+
+	w.Write([]byte(`{"status": "renamed"}`))
 }
 
 // 删除特定模组
@@ -184,6 +242,79 @@ func handleDeleteMod(w http.ResponseWriter, r *http.Request) {
 	}
 
 	targetPath := filepath.Join("./data/modpacks", packID, "mods", filename)
+	info, err := os.Stat(targetPath)
+	if err == nil {
+		db.Exec("UPDATE users SET used_bytes = used_bytes - ? WHERE id = ?", info.Size(), ownerID)
+	}
 	os.Remove(targetPath)
 	w.Write([]byte(`{"status": "deleted"}`))
+}
+
+// 检测重复模组
+func isDuplicateMod(modsDir string, targetSize int64, targetHash string, tempFileName string) bool {
+	files, _ := os.ReadDir(modsDir)
+	for _, f := range files {
+		if f.IsDir() || f.Name() == tempFileName {
+			continue
+		}
+		info, _ := f.Info()
+		if info.Size() != targetSize {
+			continue
+		}
+
+		path := filepath.Join(modsDir, f.Name())
+		file, _ := os.Open(path)
+		h := sha256.New()
+		io.Copy(h, file)
+		file.Close()
+
+		if hex.EncodeToString(h.Sum(nil)) == targetHash {
+			return true
+		}
+	}
+	return false
+}
+
+// 管理员接口：列出所有用户及其配额使用情况
+func handleAdminListUsers(w http.ResponseWriter, r *http.Request) {
+	rows, _ := db.Query("SELECT id, username, role, quota_bytes, used_bytes FROM users")
+	defer rows.Close()
+
+	var users []map[string]interface{}
+	for rows.Next() {
+		var id int
+		var username, role string
+		var quota, used int64
+		rows.Scan(&id, &username, &role, &quota, &used)
+		users = append(users, map[string]interface{}{
+			"id": id, "username": username, "role": role,
+			"quota_bytes": quota, "used_bytes": used,
+		})
+	}
+	if users == nil {
+		users = []map[string]interface{}{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(users)
+}
+
+// 管理员接口：更新用户角色或配额
+func handleAdminUpdateUser(w http.ResponseWriter, r *http.Request) {
+	targetUserID := r.PathValue("user_id")
+	var req struct {
+		Role       string `json:"role"`
+		QuotaBytes int64  `json:"quota_bytes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+
+	_, err := db.Exec("UPDATE users SET role = ?, quota_bytes = ? WHERE id = ?", req.Role, req.QuotaBytes, targetUserID)
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	w.Write([]byte(`{"status": "updated"}`))
 }

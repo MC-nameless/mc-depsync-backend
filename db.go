@@ -23,7 +23,9 @@ func initDB() {
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		username TEXT UNIQUE NOT NULL,
 		password_hash TEXT NOT NULL,
-		role TEXT NOT NULL DEFAULT 'user'
+		role TEXT NOT NULL DEFAULT 'user',
+		quota_bytes INTEGER NOT NULL DEFAULT 1073741824, -- 1GB
+		used_bytes INTEGER NOT NULL DEFAULT 0
 	);
 	
 	CREATE TABLE IF NOT EXISTS modpacks (

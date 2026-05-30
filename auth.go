@@ -32,7 +32,16 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	hash, _ := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
-	_, err := db.Exec("INSERT INTO users (username, password_hash) VALUES (?, ?)", req.Username, string(hash))
+
+	// 首个注册用户为管理员
+	var count int
+	db.QueryRow("SELECT COUNT(*) FROM users").Scan(&count)
+	role := "user"
+	if count == 0 {
+		role = "admin"
+	}
+
+	_, err := db.Exec("INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)", req.Username, string(hash), role)
 	if err != nil {
 		http.Error(w, "Username exists", http.StatusConflict)
 		return
@@ -94,6 +103,18 @@ func AuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
 		claims, _ := token.Claims.(*CustomClaims)
 		ctx := context.WithValue(r.Context(), "userID", claims.UserID)
+		ctx = context.WithValue(ctx, "userRole", claims.Role)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	}
+}
+
+func AdminMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return AuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		role := r.Context().Value("userRole").(string)
+		if role != "admin" {
+			http.Error(w, "Forbidden: Admin access only", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
