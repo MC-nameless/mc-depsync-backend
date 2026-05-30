@@ -40,7 +40,7 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: 0 
+          CGO_ENABLED: 1 
         run: |
           SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
           BINARY_NAME=mc-depsync-${{ matrix.goos }}-${{ matrix.goarch }}-${SHORT_SHA}${{ matrix.ext }}
@@ -57,3 +57,4 @@ jobs:
           name: ${{ env.BINARY_NAME }}
           path: ${{ env.BINARY_NAME }}
           retention-days: 7
+          compression-level: 0
